@@ -4,9 +4,8 @@ from sklearn.model_selection import KFold
 from models.bkt import Model as bkt_model
 from models.PFA.pfa import PFA
 from models.PFA.PFA_helper import add_pfa_features
-from models.dkt import DKT
-from models.dkt_helper import df_to_sequences, sequences_to_onehot, make_loaders
-from sklearn.metrics import roc_auc_score 
+from models.DKT.dkt import DKT
+from models.DKT.dkt_helper import make_loaders
 import numpy as np
 from sklearn.model_selection import GroupKFold   # replaces plain KFold
 from sklearn.metrics import mean_absolute_error
@@ -14,12 +13,7 @@ from pyBKT.util import metrics
 
 metrics.SUPPORTED_METRICS.setdefault("mae", mean_absolute_error)
 
-# from pykt.models import train_model, test_model
-# from pykt.models import train_model, evaluate_model # DKT modeling
-# from EduKTM import DKT
-
 import torch
-from torch.utils.data import DataLoader, TensorDataset
 from EduData import get_data
 
 class Model_Config:
@@ -54,10 +48,10 @@ class Model_Config:
             .groupby(["user_id", "skill_name"], as_index=False, sort=False)
             .first())
                 
-        unique_users = df_new['user_id'].unique()   # array-like
-        n_users = len(unique_users)                 # how many students
+        unique_users = df_new['user_id'].unique()   
+        n_users = len(unique_users)                 
 
-        if n_users > TARGET_N:                      # ← compare the count
+        if n_users > TARGET_N:                      
             rng = np.random.default_rng(RANDOM_SEED)
             sampled_users = rng.choice(unique_users,
                                     size=TARGET_N,
@@ -73,17 +67,17 @@ class Model_Config:
         unique_users = df_new["user_id"].unique()
         print("unique users:", len(unique_users))
         
-        unique_questions = df_new['problem_id'].unique()   # array-like
+        unique_questions = df_new['problem_id'].unique()   
         print("unique questions:", len(unique_questions))
         
-        unique_skills = df_new['skill_name'].unique()   # array-like
+        unique_skills = df_new['skill_name'].unique()   
         print("unique skills:", len(unique_skills))
         
         
         metrics = {"MAE": [], "RMSE": [], "AUC": []}
             
         # ----- 5-fold, user-level CV ------------------------------------------
-        gkf = GroupKFold(n_splits=5)                     # no shuffle needed
+        gkf = GroupKFold(n_splits=5)                     
         
         fold = 1
         
