@@ -11,6 +11,7 @@ from sklearn.model_selection import GroupKFold   # replaces plain KFold
 from sklearn.metrics import roc_auc_score, mean_absolute_error, mean_squared_error
 from pyBKT.util import metrics
 import re
+import torch
 
 metrics.SUPPORTED_METRICS.setdefault("mae", mean_absolute_error)
 
@@ -19,7 +20,7 @@ from torch.optim import Adam
 from torch.nn.utils.rnn import pad_sequence
 from EduData import get_data
 from models.DKT_NEW.dkt import DKT
-from models.DKT_NEW.dkt_helper import *
+from models.DKT_NEW.dkt_helper import * 
 
 class Model_Config:
     def __init__(self,args):
@@ -41,7 +42,7 @@ class Model_Config:
         
         print(df.columns)
         
-        TARGET_N = 1000
+        TARGET_N = 500
         RANDOM_SEED = 24
         
         df_new = pd.DataFrame(index=df.index) 
@@ -64,7 +65,9 @@ class Model_Config:
             .first())
 
         unique_users = df_new['user_id'].unique()   
-        n_users = len(unique_users)                 
+        n_users = len(unique_users) 
+        
+        print("n_users is ", n_users)             
 
         if n_users > TARGET_N:                      
             rng = np.random.default_rng(RANDOM_SEED)
@@ -83,6 +86,22 @@ class Model_Config:
         df_new["user_id"] = np.unique(df_new["user_id"], return_inverse=True)[1]
         df_new["problem_id"] = np.unique(df_new["problem_id"], return_inverse=True)[1]
         df_new["skill_name"] = np.unique(df_new["skill_name"], return_inverse=True)[1]
+        
+        # print("df_new skill_name  is ", df_new["skill_name"])
+        
+        # Build Q-matrix
+        Q_mat = np.zeros((len(df_new["problem_id"].unique()), len(df_new["skill_name"].unique())))
+        for item_id, skill_id in df_new[["problem_id", "skill_name"]].values:
+            Q_mat[item_id, skill_id] = 1
+        
+        unique_skill_ids = np.unique(Q_mat, axis=0, return_inverse=True)[1]
+        df_new["skill_name"] = unique_skill_ids[df_new["problem_id"]]
+        
+        df_new.sort_values(by="timestamp", inplace=True)
+        
+        df_new = pd.concat([u_df for _, u_df in df_new.groupby("user_id")])
+        
+        print("df_new headers:", df_new.columns.tolist())
         
         unique_users = df_new["user_id"].unique()
         print("unique users:", len(unique_users))
@@ -209,92 +228,63 @@ class Model_Config:
             #     # 4) final evaluation
             #     # ------------------------------------------------------------
             #     test_mae, test_rmse, test_auc = model.eval(test_loader)
-            
+
             if self.args.KT_model[0] == 'DKT':
                 print("DKT") 
-                print("train_tf is ", train_df)
-                print("test_tf is ", test_df)
+                # print("train_tf is ", train_df)
+                # print("test_tf is ", test_df)
                 
                 embed_size=10
-                hid_size=32
-                num_hid_layers=3
-                drop_prob=0.5
+                hid_size=8
+                num_hid_layers=5
+                drop_prob=0.7
                 batch_size=20
-                lr=1e-6
-                num_epochs=100
+                lr=6e-4
+                num_epochs=120
+                pad_val = -1
                 
+                DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
                 set_random_seeds(RANDOM_SEED)
                 
-                train_data, val_data = get_data(train_df, train_split=0.8)
+                train_data, _ = get_data(train_df, train_split=1)
                 
                 model = DKT(int(df_new["problem_id"].max()), int(df_new["skill_name"].max()), hid_size,
-                             embed_size, num_hid_layers, drop_prob).cuda()
-                optimizer = Adam(model.parameters(), lr=lr)
+                             embed_size, num_hid_layers, drop_prob).to(DEVICE)
                 
-                criterion = nn.BCEWithLogitsLoss()
-                step = 0
+                optimizer = Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+                bce       = nn.BCEWithLogitsLoss() 
                 
-                for epoch in range(num_epochs):
-                    train_batches = prepare_batches(train_data, batch_size)
-                    val_batches = prepare_batches(val_data, batch_size)
-
-                    for item_inputs, skill_inputs, label_inputs, item_ids, skill_ids, labels in train_batches:
+                # ---------------- training loop -------------------------
+                for epoch in range(1, num_epochs + 1):
+                    model.train()
+                    
+                    for batch in prepare_batches(train_data, batch_size, pad_val=pad_val):
+                        item_in, skill_in, label_in, item_id, skill_id, lbl = [
+                            t.to(DEVICE) for t in batch
+                        ]
                         
-                        item_inputs = item_inputs.cuda()
-                        skill_inputs = skill_inputs.cuda()
-                        label_inputs = label_inputs.cuda()
-                        item_ids = item_ids.cuda()
-                        skill_ids = skill_ids.cuda()
-                        preds = model(item_inputs, skill_inputs, label_inputs, item_ids, skill_ids)
+                        logits = model(item_in, skill_in, label_in, item_id, skill_id)
+                        loss = bce(logits[lbl >= 0], lbl[lbl >= 0].float())
                         
-                        loss = compute_loss(preds, labels.cuda(), criterion)
-                        train_auc = compute_auc(torch.sigmoid(preds).detach().cpu(), labels)
-                        
-                        model.zero_grad()
+                        optimizer.zero_grad()
                         loss.backward()
                         optimizer.step()
-                        step += 1
-                        
-                        # print("train_auc are ", train_auc)
                     
-                    # Validation
-                    model.eval()
-                    for item_inputs, skill_inputs, label_inputs, item_ids, skill_ids, labels in val_batches:
-                        with torch.no_grad():
-                            item_inputs = item_inputs.cuda()
-                            skill_inputs = skill_inputs.cuda()
-                            label_inputs = label_inputs.cuda()
-                            item_ids = item_ids.cuda()
-                            skill_ids = skill_ids.cuda()
-                            preds = model(item_inputs, skill_inputs, label_inputs, item_ids, skill_ids)
-                        val_auc = compute_auc(torch.sigmoid(preds).cpu(), labels)
-                        
-                    model.train()
-                
-                test_data, _ = get_data(test_df, train_split=1.0, randomize=False)
-                test_batches = prepare_batches(test_data, batch_size, randomize=False)
-                test_preds = np.empty(0)
-                
+                    # ---------------- epoch-level metrics ---------------
+                    train_m = evaluate_split(model, train_data, batch_size, pad_val)
+                    print(f"Epoch {epoch:02d} | "
+                        f"AUC={fmt(train_m['auc'])}  "
+                        f"MAE={train_m['mae']:.4f}  "
+                        f"RMSE={train_m['rmse']:.4f}")
+
+                # ---------- testing stage ----------
                 model.eval()
-                for item_inputs, skill_inputs, label_inputs, item_ids, skill_ids, labels in test_batches:
-                    with torch.no_grad():
-                        item_inputs = item_inputs.cuda()
-                        skill_inputs = skill_inputs.cuda()
-                        label_inputs = label_inputs.cuda()
-                        item_ids = item_ids.cuda()
-                        skill_ids = skill_ids.cuda()
-                        preds = model(item_inputs, skill_inputs, label_inputs, item_ids, skill_ids)
-                        preds = torch.sigmoid(preds[labels >= 0]).cpu().numpy()
-                        test_preds = np.concatenate([test_preds, preds])
-                
-                # AUC
-                test_auc = roc_auc_score(test_df["correct"], test_preds)
+                test_data, _ = get_data(test_df, train_split=1.0, randomize=False)
+                test_m = evaluate_split(model, test_data, batch_size, pad_val)
 
-                # MAE
-                test_mae = mean_absolute_error(test_df["correct"], test_preds)
-
-                # RMSE
-                test_rmse = np.sqrt(mean_squared_error(test_df["correct"], test_preds))
+                test_mae  = test_m["mae"]
+                test_rmse = test_m["rmse"]
+                test_auc  = test_m["auc"]
                 
             for k, v in zip(["MAE", "RMSE", "AUC"], [test_mae, test_rmse, test_auc]):
                 metrics[k].append(v)
