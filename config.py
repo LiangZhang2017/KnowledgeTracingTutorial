@@ -4,17 +4,22 @@ from sklearn.model_selection import KFold
 from models.bkt import Model as bkt_model
 from models.PFA.pfa import PFA
 from models.PFA.PFA_helper import add_pfa_features
-from models.DKT.dkt import DKT
-from models.DKT.dkt_helper import make_loaders
+# from models.DKT.dkt import DKT
+# from models.DKT.dkt_helper import make_loaders
 import numpy as np
 from sklearn.model_selection import GroupKFold   # replaces plain KFold
-from sklearn.metrics import mean_absolute_error
+from sklearn.metrics import roc_auc_score, mean_absolute_error, mean_squared_error
 from pyBKT.util import metrics
+import re
 
 metrics.SUPPORTED_METRICS.setdefault("mae", mean_absolute_error)
 
-import torch
+import torch.nn as nn
+from torch.optim import Adam
+from torch.nn.utils.rnn import pad_sequence
 from EduData import get_data
+from models.DKT_NEW.dkt import DKT
+from models.DKT_NEW.dkt_helper import *
 
 class Model_Config:
     def __init__(self,args):
@@ -23,16 +28,24 @@ class Model_Config:
     def main(self):
         print("start run model")
         
+        data_source=self.args.data_source[0]
+        
         #Read the dataset from file path
         full_path = os.getcwd()+self.args.data_path[0]
-        df = pd.read_csv(full_path)
+        
+        if data_source=="DataShop":
+            df=pd.read_csv(full_path,sep="\t")
+
+        if data_source=="ASSISTments":
+            df = pd.read_csv(full_path)
+        
         print(df.columns)
         
-        TARGET_N = 500
+        TARGET_N = 1000
         RANDOM_SEED = 24
         
         df_new = pd.DataFrame(index=df.index) 
-
+        
         # Mapping columns
         df_new['user_id']=df[self.args.user_id[0]]
         df_new['skill_name']=df[self.args.skill_id[0]]
@@ -40,14 +53,16 @@ class Model_Config:
         df_new['timestamp']=df[self.args.timestamp[0]]
         df_new['problem_id']=df[self.args.problem_id[0]]
         
+        df_new['skill_name'] = pd.Categorical(df[self.args.skill_id[0]]).codes
         df_new = df_new.dropna(subset=['skill_name'])
         df_new = df_new.dropna(subset=['correct'])
-        
+        df_new = df_new.sort_values("timestamp", ascending=True)
+
         # 1. keep earliest try per learner–problem  (skill_name optional here)
         df_new = (df_new
             .groupby(["user_id", "skill_name"], as_index=False, sort=False)
             .first())
-                
+
         unique_users = df_new['user_id'].unique()   
         n_users = len(unique_users)                 
 
@@ -57,12 +72,17 @@ class Model_Config:
                                     size=TARGET_N,
                                     replace=False)
             df_new = df_new[df_new['user_id'].isin(sampled_users)]
+            
             print(f"Sub-sampled to {TARGET_N} students "
                 f"({len(df_new)} total interactions).")
         else:
             print(f"Dataset has only {n_users} students – using them all.")
     
-        print(df_new.head())
+        print("df_new is ", df_new.head())
+    
+        df_new["user_id"] = np.unique(df_new["user_id"], return_inverse=True)[1]
+        df_new["problem_id"] = np.unique(df_new["problem_id"], return_inverse=True)[1]
+        df_new["skill_name"] = np.unique(df_new["skill_name"], return_inverse=True)[1]
         
         unique_users = df_new["user_id"].unique()
         print("unique users:", len(unique_users))
@@ -73,9 +93,8 @@ class Model_Config:
         unique_skills = df_new['skill_name'].unique()   
         print("unique skills:", len(unique_skills))
         
-        
         metrics = {"MAE": [], "RMSE": [], "AUC": []}
-            
+        
         # ----- 5-fold, user-level CV ------------------------------------------
         gkf = GroupKFold(n_splits=5)                     
         
@@ -92,10 +111,17 @@ class Model_Config:
 
             print(f"Train users: {len(train_users)}, Test users: {len(test_users)}")
             print(f"Train shape: {train_df.shape}, Test shape: {test_df.shape}")
-            
+
             if self.args.KT_model[0]=='BKT':
                print("Standard setting")
-
+               
+               meta = r'([\\.^$*+?{}\[\]|()])'          # characters that must be escaped
+               df_new['skill_name'] = (
+                    df_new['skill_name']
+                    .astype(str)
+                    .str.replace(meta, r'\\\1', regex=True)
+                )
+               
                model = bkt_model(seed=42, num_fits=5)
                model.fit(data=train_df)
                training_rmse = model.evaluate(data = train_df)
@@ -142,48 +168,134 @@ class Model_Config:
                test_rmse = model.metrics["RMSE"]
                test_auc  = model.metrics["AUC"]
                
-            if self.args.KT_model[0] == 'DKT':
-                print("DKT")
+            # if self.args.KT_model[0] == 'DKT':
+            #     print("DKT")
 
-                DEVICE     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                BATCH_SIZE = 20
-                EPOCHS     = 100
-                HIDDEN     = 100
+            #     DEVICE     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            #     BATCH_SIZE = 20
+            #     EPOCHS     = 120
+            #     HIDDEN     = 32
 
-                # ------------------------------------------------------------
-                # 1) build DataLoaders
-                # ------------------------------------------------------------
-                train_loader, test_loader, n_skill = make_loaders(train_df, test_df)
+            #     # ------------------------------------------------------------
+            #     # 1) build DataLoaders
+            #     # ------------------------------------------------------------
+            #     train_loader, test_loader, n_skill = make_loaders(train_df, test_df)
 
-                # ------------------------------------------------------------
-                # 2) create the DKT wrapper (CPU; its inner .dkt_model is PyTorch)
-                # ------------------------------------------------------------
-                model = DKT(
-                    num_questions=n_skill,
-                    hidden_size=32,
-                    num_layers=3,     
-                    dropout=0.4       
-                )
+            #     # ------------------------------------------------------------
+            #     # 2) create the DKT wrapper (CPU; its inner .dkt_model is PyTorch)
+            #     # ------------------------------------------------------------
+            #     model = DKT(
+            #         num_questions=n_skill,
+            #         hidden_size=HIDDEN,
+            #         num_layers=3,     
+            #         dropout=0.4       
+            #     )
 
-                # (optional) move the inner net to GPU if available
-                model.dkt_model.to(DEVICE)
+            #     # (optional) move the inner net to GPU if available
+            #     model.dkt_model.to(DEVICE)
 
-                # ------------------------------------------------------------
-                # 3) train — your DKT class already implements its own loop
-                # ------------------------------------------------------------
-                model.train(
-                    train_loader,
-                    test_data=test_loader,
-                    epoch=100,
-                    lr=3e-4,          # >100× larger
-                    weight_decay=1e-4
-                )
+            #     # ------------------------------------------------------------
+            #     # 3) train — your DKT class already implements its own loop
+            #     # ------------------------------------------------------------
+            #     model.train(
+            #         train_loader,
+            #         test_data=test_loader,
+            #         epoch=EPOCHS,
+            #         lr=3e-4,          # >100× larger
+            #         weight_decay=1e-4
+            #     )
 
-                # ------------------------------------------------------------
-                # 4) final evaluation
-                # ------------------------------------------------------------
-                test_mae, test_rmse, test_auc = model.eval(test_loader)
+            #     # ------------------------------------------------------------
+            #     # 4) final evaluation
+            #     # ------------------------------------------------------------
+            #     test_mae, test_rmse, test_auc = model.eval(test_loader)
             
+            if self.args.KT_model[0] == 'DKT':
+                print("DKT") 
+                print("train_tf is ", train_df)
+                print("test_tf is ", test_df)
+                
+                embed_size=10
+                hid_size=32
+                num_hid_layers=3
+                drop_prob=0.5
+                batch_size=20
+                lr=1e-6
+                num_epochs=100
+                
+                set_random_seeds(RANDOM_SEED)
+                
+                train_data, val_data = get_data(train_df, train_split=0.8)
+                
+                model = DKT(int(df_new["problem_id"].max()), int(df_new["skill_name"].max()), hid_size,
+                             embed_size, num_hid_layers, drop_prob).cuda()
+                optimizer = Adam(model.parameters(), lr=lr)
+                
+                criterion = nn.BCEWithLogitsLoss()
+                step = 0
+                
+                for epoch in range(num_epochs):
+                    train_batches = prepare_batches(train_data, batch_size)
+                    val_batches = prepare_batches(val_data, batch_size)
+
+                    for item_inputs, skill_inputs, label_inputs, item_ids, skill_ids, labels in train_batches:
+                        
+                        item_inputs = item_inputs.cuda()
+                        skill_inputs = skill_inputs.cuda()
+                        label_inputs = label_inputs.cuda()
+                        item_ids = item_ids.cuda()
+                        skill_ids = skill_ids.cuda()
+                        preds = model(item_inputs, skill_inputs, label_inputs, item_ids, skill_ids)
+                        
+                        loss = compute_loss(preds, labels.cuda(), criterion)
+                        train_auc = compute_auc(torch.sigmoid(preds).detach().cpu(), labels)
+                        
+                        model.zero_grad()
+                        loss.backward()
+                        optimizer.step()
+                        step += 1
+                        
+                        # print("train_auc are ", train_auc)
+                    
+                    # Validation
+                    model.eval()
+                    for item_inputs, skill_inputs, label_inputs, item_ids, skill_ids, labels in val_batches:
+                        with torch.no_grad():
+                            item_inputs = item_inputs.cuda()
+                            skill_inputs = skill_inputs.cuda()
+                            label_inputs = label_inputs.cuda()
+                            item_ids = item_ids.cuda()
+                            skill_ids = skill_ids.cuda()
+                            preds = model(item_inputs, skill_inputs, label_inputs, item_ids, skill_ids)
+                        val_auc = compute_auc(torch.sigmoid(preds).cpu(), labels)
+                        
+                    model.train()
+                
+                test_data, _ = get_data(test_df, train_split=1.0, randomize=False)
+                test_batches = prepare_batches(test_data, batch_size, randomize=False)
+                test_preds = np.empty(0)
+                
+                model.eval()
+                for item_inputs, skill_inputs, label_inputs, item_ids, skill_ids, labels in test_batches:
+                    with torch.no_grad():
+                        item_inputs = item_inputs.cuda()
+                        skill_inputs = skill_inputs.cuda()
+                        label_inputs = label_inputs.cuda()
+                        item_ids = item_ids.cuda()
+                        skill_ids = skill_ids.cuda()
+                        preds = model(item_inputs, skill_inputs, label_inputs, item_ids, skill_ids)
+                        preds = torch.sigmoid(preds[labels >= 0]).cpu().numpy()
+                        test_preds = np.concatenate([test_preds, preds])
+                
+                # AUC
+                test_auc = roc_auc_score(test_df["correct"], test_preds)
+
+                # MAE
+                test_mae = mean_absolute_error(test_df["correct"], test_preds)
+
+                # RMSE
+                test_rmse = np.sqrt(mean_squared_error(test_df["correct"], test_preds))
+                
             for k, v in zip(["MAE", "RMSE", "AUC"], [test_mae, test_rmse, test_auc]):
                 metrics[k].append(v)
 
